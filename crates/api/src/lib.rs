@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::fmt::Display;
 
-use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
+use jni::{Env, EnvUnowned, Outcome, jni_sig, jni_str};
 
 pub use jni::errors::Error as JniError;
 pub type Result<T = ()> = std::result::Result<T, JniError>;
@@ -27,7 +27,7 @@ impl<'local> CallbackInfo<'local> {
     /// which propagates as `JniError::JavaException`.
     pub fn cancel(&self) -> Result<()> {
         with_env(|env| {
-            env.call_method(&self.inner, "cancel", "()V", &[])?;
+            env.call_method(&self.inner, jni_str!("cancel"), jni_sig!(() -> void), &[])?;
             Ok(())
         })
     }
@@ -48,9 +48,9 @@ pub struct EnvGuard {
 impl EnvGuard {
     /// # Safety
     /// `env` is valid only within the lifetime of the calling JNI function.
-    /// Do not create any other reference to env until this guard is dropped.
-    pub unsafe fn enter(env: &mut JNIEnv) -> Self {
-        let raw = env.get_raw();
+    /// The stored raw pointer must not be used after this guard is dropped.
+    pub unsafe fn enter(env: &EnvUnowned) -> Self {
+        let raw = env.as_raw();
         let prev = CURRENT_ENV.with(|c| c.replace(raw));
         EnvGuard { prev }
     }
@@ -62,16 +62,23 @@ impl Drop for EnvGuard {
     }
 }
 
-fn with_env<R>(f: impl FnOnce(&mut JNIEnv) -> R) -> R {
+fn with_env<T>(f: impl FnOnce(&mut Env) -> Result<T>) -> Result<T> {
     let raw = CURRENT_ENV.with(|c| c.get());
     assert!(
         !raw.is_null(),
         "api::* called outside of a #[inject] function"
     );
     // SAFETY: EnvGuard has registered the env of the JNI function currently
-    // active on this thread.
-    let mut env = unsafe { JNIEnv::from_raw(raw).expect("invalid JNIEnv pointer") };
-    f(&mut env)
+    // active on this thread, so the pointer is a valid attachment for the
+    // duration of that call. Since 0.22 the JNI API lives on `Env`, reachable
+    // only by upgrading an `EnvUnowned` via `with_env`.
+    let mut unowned = unsafe { EnvUnowned::from_raw(raw) };
+    match unowned.with_env(f).into_outcome() {
+        Outcome::Ok(t) => Ok(t),
+        Outcome::Err(e) => Err(e),
+        // `with_env` catches panics; re-raise to preserve unwinding semantics.
+        Outcome::Panic(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Calls `System.out.println(value.to_string())` over JNI.
@@ -79,13 +86,14 @@ pub fn println<T: Display>(value: T) -> Result<()> {
     let s = value.to_string();
     with_env(|env| -> Result<()> {
         let jstr = env.new_string(&s)?;
-        let system_cls = env.find_class("java/lang/System")?;
-        let out = env.get_static_field(&system_cls, "out", "Ljava/io/PrintStream;")?;
+        let system_cls = env.find_class(jni_str!("java/lang/System"))?;
+        let out =
+            env.get_static_field(&system_cls, jni_str!("out"), jni_sig!(java.io.PrintStream))?;
         let out_obj = out.l()?;
         env.call_method(
             &out_obj,
-            "println",
-            "(Ljava/lang/String;)V",
+            jni_str!("println"),
+            jni_sig!((java.lang.String) -> void),
             &[JValue::from(&jstr)],
         )?;
         Ok(())

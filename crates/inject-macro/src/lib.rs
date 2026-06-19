@@ -131,16 +131,15 @@ pub fn inject(args: TokenStream, input: TokenStream) -> TokenStream {
 
         #[unsafe(no_mangle)]
         pub extern "system" fn #jni_ident<'local>(
-            env: ::jni::JNIEnv<'local>,
+            env: ::jni::EnvUnowned<'local>,
             _cls: ::jni::objects::JClass<'local>,
             #(#jni_param_decls ,)*
             #ci_param_decl
         ) {
-            let mut env = env;
             // SAFETY: `env` is valid only for the duration of this JNI function
-            // call and lives in the same scope as the guard, so it never
-            // outlives the guard.
-            let _guard = unsafe { ::api::EnvGuard::enter(&mut env) };
+            // call and lives in the same scope as the guard, so the raw pointer
+            // it registers never outlives the guard.
+            let _guard = unsafe { ::api::EnvGuard::enter(&env) };
             #inner_ident( #(#call_arg_exprs),* );
         }
     }
